@@ -376,6 +376,7 @@ static int run(const char *trace_path)
 		if (dark) {
 			dl_controller_restart(&c);
 			pn.foreign = false;
+			wait = DARK_CHECK_S;
 			goto sleep;
 		}
 

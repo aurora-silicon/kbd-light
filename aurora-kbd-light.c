@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #define TICK_MS 250		/* sensor poll while steady */
+#define IDLE_TICK_MS 2000	/* poll while backlight is steady and off */
 #define FADE_TICK_MS 40		/* LED steps while fading */
 #define FADE_MS 600		/* duration of a full-range fade */
 #define SMOOTH_S 2.0		/* time constant of the lux average */
@@ -289,27 +290,51 @@ static double suspended_s(void)
 
 /*
  * Wait ms, noting the time of the last key press in *last_key. Only the
- * timing of key events is used. With wake set, return at the first one.
+ * timing of key events is used. Always returns on a lid switch event; with
+ * wake set, also returns at the first key press.
  */
-static void wait_ms(int ms, double *last_key, bool wake)
+static void wait_ms(int ms, int *lid_fd, double *last_key, bool wake)
 {
 	double end = now_s() + ms / 1000.0;
-	struct pollfd p[MAX_KEYBOARDS];
+	struct pollfd p[MAX_KEYBOARDS + 1];
 
-	if (!kbd_count) {
+	if (!kbd_count && *lid_fd < 0) {
 		sleep_ms(ms);
 		return;
 	}
 	while (!stop) {
 		int left = (int)ceil((end - now_s()) * 1000);
-		bool key = false;
+		int nfds = 0, lid_idx = -1;
+		bool key = false, lid_ev = false;
 
 		if (left <= 0)
 			return;
 		for (int i = 0; i < kbd_count; i++)
-			p[i] = (struct pollfd){ .fd = kbd_fd[i], .events = POLLIN };
-		if (poll(p, kbd_count, left) <= 0)
+			p[nfds++] = (struct pollfd){ .fd = kbd_fd[i], .events = POLLIN };
+		if (*lid_fd >= 0) {
+			lid_idx = nfds++;
+			p[lid_idx] = (struct pollfd){ .fd = *lid_fd, .events = POLLIN };
+		}
+		if (!nfds) {
+			sleep_ms(left);
 			return;
+		}
+		if (poll(p, nfds, left) <= 0)
+			return;
+		if (lid_idx >= 0) {
+			if (p[lid_idx].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				close(*lid_fd);
+				*lid_fd = -1;
+			} else if (p[lid_idx].revents & POLLIN) {
+				struct input_event ev[16];
+				ssize_t len;
+
+				while ((len = read(*lid_fd, ev, sizeof(ev))) > 0)
+					for (size_t j = 0; j < (size_t)len / sizeof(ev[0]); j++)
+						if (ev[j].type == EV_SW && ev[j].code == SW_LID)
+							lid_ev = true;
+			}
+		}
 		for (int i = kbd_count - 1; i >= 0; i--) {
 			struct input_event ev[64];
 			ssize_t len;
@@ -331,6 +356,8 @@ static void wait_ms(int ms, double *last_key, bool wake)
 			if (wake)
 				return;
 		}
+		if (lid_ev)
+			return;
 	}
 }
 
@@ -362,9 +389,10 @@ int main(int argc, char **argv)
 		.idle_pct = (int)env_double("AURORA_KBD_LIGHT_IDLE_PERCENT", 0),
 	};
 	char *led_dir, *als_path, bright_path[512], max_path[512];
-	double log_lux = NAN, last_t, hold_log_lux = 0;
+	double log_lux = NAN, last_t, last_als_t = -1, hold_log_lux = 0;
 	long max, cur, written = -1, auto_last = -1, hold_level = 0, target, idle_level;
 	bool hold = false, off_latch = false, write_failed = false, was_dark = false;
+	bool als_paused = false;
 	/* dimmed: capped at the idle level now; dim_shown: that level is what was last shown */
 	bool dimmed = false, dim_shown = false;
 	double lid_retry_t, dark_since = -1, last_key, kbd_scan_t, suspended;
@@ -414,7 +442,7 @@ int main(int argc, char **argv)
 
 	while (!stop) {
 		double lux, t = now_s(), dt = t - last_t;
-		bool fading, dark, automatic, idle;
+		bool fading, lid, dark, automatic, idle, off_idle, pause_als;
 
 		last_t = t;
 		/* The lid switch can register after this starts. */
@@ -436,7 +464,7 @@ int main(int argc, char **argv)
 			suspended = s;
 		}
 		if (read_int(bright_path, &cur)) {
-			wait_ms(TICK_MS, &last_key, false);
+			wait_ms(TICK_MS, &lid_fd, &last_key, false);
 			continue;
 		}
 
@@ -454,7 +482,7 @@ int main(int argc, char **argv)
 				} else {
 					hold = true;
 					hold_level = cur;
-					hold_log_lux = log_lux;
+					hold_log_lux = als_paused ? NAN : log_lux;
 				}
 			}
 			if (c.verbose)
@@ -464,15 +492,6 @@ int main(int argc, char **argv)
 			written = cur;
 		}
 
-		if (read_lux(als_path, &lux) == 0) {
-			double l = log10(lux + 0.01);
-
-			log_lux = isnan(log_lux) ? l :
-				  log_lux + (l - log_lux) * (dt / (SMOOTH_S + dt));
-		}
-		if (hold && !isnan(log_lux) && fabs(log_lux - hold_log_lux) > log10(HOLD_RATIO))
-			hold = false;
-
 		if (written < 0)
 			written = cur;	/* first pass: start from what is set */
 
@@ -480,13 +499,37 @@ int main(int argc, char **argv)
 			dark_since = -1;
 		else if (dark_since < 0)
 			dark_since = t;
-		dark = lid_closed(lid_fd) ||
-		       (dark_since >= 0 && t - dark_since >= DISPLAYS_OFF_S);
+		lid = lid_closed(lid_fd);
+		dark = lid || (dark_since >= 0 && t - dark_since >= DISPLAYS_OFF_S);
 		/* Opening the lid or waking a display counts as a key press. */
 		if (was_dark && !dark)
 			last_key = t;
 		was_dark = dark;
-		idle = kbd_count > 0 && t - last_key >= c.idle_s;
+		idle = c.idle_s > 0 && kbd_count > 0 && t - last_key >= c.idle_s;
+		off_idle = idle && idle_level == 0;
+
+		/*
+		 * While the backlight is steady and off because of lid/display sleep,
+		 * manual off-latch, or zero-level idle timeout, skip sysfs ALS reads
+		 * and back off polling to IDLE_TICK_MS to reduce daemon wakeups and
+		 * sysfs work.
+		 */
+		pause_als = written == 0 && (dark || off_latch || off_idle);
+		if (!pause_als && read_lux(als_path, &lux) == 0) {
+			double dt_als = last_als_t >= 0 ? t - last_als_t : dt;
+			double l = log10(lux + 0.01);
+
+			last_als_t = t;
+			if (hold && isnan(hold_log_lux))
+				log_lux = hold_log_lux = l;
+			else
+				log_lux = isnan(log_lux) ? l :
+					  log_lux + (l - log_lux) * (dt_als / (SMOOTH_S + dt_als));
+		}
+		als_paused = pause_als;
+		if (hold && !isnan(log_lux) && !isnan(hold_log_lux) &&
+		    fabs(log_lux - hold_log_lux) > log10(HOLD_RATIO))
+			hold = false;
 
 		/* A closed lid or sleeping displays win; a held level comes back after. */
 		automatic = false;
@@ -498,8 +541,10 @@ int main(int argc, char **argv)
 			/* Dimmed for idle, it was lit: keep the off threshold. */
 			target = auto_level(&c, log_lux, written > 0 || dimmed, max);
 			automatic = true;
+		} else if (off_idle) {
+			target = 0;
 		} else {
-			wait_ms(TICK_MS, &last_key, false);
+			wait_ms(TICK_MS, &lid_fd, &last_key, false);
 			continue;
 		}
 		/* No key press for a while: no brighter than the idle level. */
@@ -549,8 +594,9 @@ int main(int argc, char **argv)
 			else if (automatic || hold)
 				dim_shown = false;
 		}
-		/* While dimmed, come back at the first key press. */
-		wait_ms(fading ? FADE_TICK_MS : TICK_MS, &last_key, dimmed);
+		/* While dimmed or paused off (except closed lid / off_latch), wake on a key press. */
+		wait_ms(fading ? FADE_TICK_MS : pause_als ? IDLE_TICK_MS : TICK_MS,
+			&lid_fd, &last_key, dimmed || (pause_als && !off_latch && !lid));
 	}
 
 	if (lid_fd >= 0)
