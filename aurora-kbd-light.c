@@ -510,8 +510,9 @@ int main(int argc, char **argv)
 
 		/*
 		 * While the backlight is steady and off because of lid/display sleep,
-		 * manual off-latch, or zero-level idle timeout, skip ALS reads and
-		 * back off polling so the AOP sensor mailbox stays quiet.
+		 * manual off-latch, or zero-level idle timeout, skip sysfs ALS reads
+		 * and back off polling to IDLE_TICK_MS to reduce daemon wakeups and
+		 * sysfs work.
 		 */
 		pause_als = written == 0 && (dark || off_latch || off_idle);
 		if (!pause_als && read_lux(als_path, &lux) == 0) {
