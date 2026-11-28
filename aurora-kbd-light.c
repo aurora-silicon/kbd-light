@@ -8,8 +8,9 @@
  * slider, idle dimming) is respected: setting it to zero keeps it off until it
  * is turned on again, and any other level holds until the room's light
  * changes a lot. With the lid closed or the displays asleep the backlight
- * is off. It also dims after a time without a key press and comes
- * back at the next one.
+ * is off, and the light sensor in the lid is not read, so the level comes
+ * back as it was. It dims after a time without a key press and
+ * comes back at the next one.
  *
  * Only sysfs and evdev are used, so this needs nothing beyond libc.
  */
@@ -36,6 +37,8 @@
 #define DEADBAND 3		/* ignore smaller level changes */
 #define HOLD_RATIO 4.0		/* light change that ends a manual hold */
 #define DISPLAYS_OFF_S 1.0	/* displays dark this long: backlight off */
+#define SETTLE_RISE 1.25	/* a rise this large: the lid is still opening */
+#define SETTLE_STEADY_MS (4 * TICK_MS)	/* no such rise this long: reading the room */
 #define DEFAULT_IDLE_S 30	/* idle keyboard timeout; 0 disables it */
 #define RESCAN_S 30		/* look for new keyboards this often */
 #define MAX_KEYBOARDS 16
@@ -350,6 +353,40 @@ static long auto_level(const struct config *c, double log_lux, bool lit, long ma
 	return lround(max * pct / 100.0);
 }
 
+struct settle {
+	bool active;		/* readings watched, not used yet */
+	double max_log_lux;	/* highest log10(lux) seen since waking */
+	double since;		/* monotonic time of the last rise */
+	double started;		/* monotonic time the lid opened or display woke */
+};
+
+static void settle_reset(struct settle *s, double t)
+{
+	s->active = true;
+	s->max_log_lux = NAN;
+	s->since = t;
+	s->started = t;
+}
+
+/*
+ * Watch the sensor until it stops rising. Only upward steps reset the
+ * window, so settling ends even if room light flickers.
+ */
+static bool settle_update(struct settle *s, double log_lux, double t)
+{
+	if (!s->active)
+		return true;
+	if (isnan(s->max_log_lux) || log_lux > s->max_log_lux + log10(SETTLE_RISE)) {
+		s->max_log_lux = log_lux;
+		s->since = t;
+		return false;
+	}
+	if (t - s->since < SETTLE_STEADY_MS / 1000.0)
+		return false;
+	s->active = false;
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	struct config c = {
@@ -365,8 +402,11 @@ int main(int argc, char **argv)
 	double log_lux = NAN, last_t, hold_log_lux = 0;
 	long max, cur, written = -1, auto_last = -1, hold_level = 0, target, idle_level;
 	bool hold = false, off_latch = false, write_failed = false, was_dark = false;
+	/* relight: lit when it went dark */
+	bool relight = false;
 	/* dimmed: capped at the idle level now; dim_shown: that level is what was last shown */
 	bool dimmed = false, dim_shown = false;
+	struct settle settle = { 0 };
 	double lid_retry_t, dark_since = -1, last_key, kbd_scan_t, suspended;
 	int lid_fd;
 
@@ -413,27 +453,25 @@ int main(int argc, char **argv)
 	suspended = suspended_s();
 
 	while (!stop) {
-		double lux, t = now_s(), dt = t - last_t;
-		bool fading, dark, automatic, idle;
+		double lux, t = now_s(), dt = t - last_t, s = suspended_s();
+		bool fading, dark, automatic, idle, resumed = s - suspended > 2;
 
 		last_t = t;
+		suspended = s;
 		/* The lid switch can register after this starts. */
 		if (lid_fd < 0 && t - lid_retry_t > 30) {
 			lid_retry_t = t;
 			lid_fd = open_lid();
 		}
-		if (c.idle_s > 0) {
-			double s = suspended_s();
-
+		if (c.idle_s > 0 && t - kbd_scan_t > RESCAN_S) {
 			/* Keyboards come and go. */
-			if (t - kbd_scan_t > RESCAN_S) {
-				kbd_scan_t = t;
-				open_keyboards();
-			}
-			/* Waking from suspend counts as a key press. */
-			if (s - suspended > 2)
-				last_key = t;
-			suspended = s;
+			kbd_scan_t = t;
+			open_keyboards();
+		}
+		/* Waking from suspend counts as a key press and may have missed the lid close. */
+		if (resumed) {
+			last_key = t;
+			settle_reset(&settle, t);
 		}
 		if (read_int(bright_path, &cur)) {
 			wait_ms(TICK_MS, &last_key, false);
@@ -444,7 +482,7 @@ int main(int argc, char **argv)
 		if (written >= 0 && cur != written) {
 			if (cur == 0) {
 				off_latch = true;
-				hold = false;
+				hold = relight = false;
 			} else {
 				/* A slider adjustment also counts as activity. */
 				last_key = t;
@@ -454,7 +492,7 @@ int main(int argc, char **argv)
 				} else {
 					hold = true;
 					hold_level = cur;
-					hold_log_lux = log_lux;
+					hold_log_lux = settle.active ? NAN : log_lux;
 				}
 			}
 			if (c.verbose)
@@ -463,15 +501,6 @@ int main(int argc, char **argv)
 					hold ? "holding" : "resuming");
 			written = cur;
 		}
-
-		if (read_lux(als_path, &lux) == 0) {
-			double l = log10(lux + 0.01);
-
-			log_lux = isnan(log_lux) ? l :
-				  log_lux + (l - log_lux) * (dt / (SMOOTH_S + dt));
-		}
-		if (hold && !isnan(log_lux) && fabs(log_lux - hold_log_lux) > log10(HOLD_RATIO))
-			hold = false;
 
 		if (written < 0)
 			written = cur;	/* first pass: start from what is set */
@@ -482,10 +511,45 @@ int main(int argc, char **argv)
 			dark_since = t;
 		dark = lid_closed(lid_fd) ||
 		       (dark_since >= 0 && t - dark_since >= DISPLAYS_OFF_S);
-		/* Opening the lid or waking a display counts as a key press. */
-		if (was_dark && !dark)
+		if (dark && !was_dark)
+			relight = relight || written > 0;
+		if (dark) {
+			settle_reset(&settle, t);
+		} else if (was_dark) {
+			/* Opening the lid or waking a display counts as a key press. */
 			last_key = t;
+			settle.started = t;
+		}
 		was_dark = dark;
+
+		/*
+		 * The sensor sits in the lid: closed, it reads about 0 lux, and it
+		 * takes a few seconds to climb back to the room's light after the lid
+		 * opens. Watch it until it stops rising and keep the last reading
+		 * meanwhile, so neither ends a held level or shows a dark-room level
+		 * for a moment.
+		 */
+		if (!dark && read_lux(als_path, &lux) == 0) {
+			/* Below full_lux the automatic level is flat; clamp 0/1 lux rounding. */
+			double l = log10(fmax(lux, c.full_lux));
+			bool was_settling = settle.active;
+
+			if (settle_update(&settle, l, t)) {
+				if (was_settling && c.verbose)
+					fprintf(stderr,
+						"light sensor steady at %.1f lux, %.1f s after waking\n",
+						lux, t - settle.started);
+				if (hold && isnan(hold_log_lux))
+					log_lux = hold_log_lux = l;
+				else
+					log_lux = isnan(log_lux) ? l :
+						  log_lux + (l - log_lux) * (dt / (SMOOTH_S + dt));
+			}
+		}
+		if (hold && !settle.active && !isnan(log_lux) && !isnan(hold_log_lux) &&
+		    fabs(log_lux - hold_log_lux) > log10(HOLD_RATIO))
+			hold = false;
+
 		idle = kbd_count > 0 && t - last_key >= c.idle_s;
 
 		/* A closed lid or sleeping displays win; a held level comes back after. */
@@ -494,10 +558,14 @@ int main(int argc, char **argv)
 			target = 0;
 		} else if (hold) {
 			target = hold_level;
+			relight = false;
 		} else if (!isnan(log_lux)) {
-			/* Dimmed for idle, it was lit: keep the off threshold. */
-			target = auto_level(&c, log_lux, written > 0 || dimmed, max);
+			/* Dimmed for idle or dark for a while, it was lit: keep the off threshold. */
+			target = auto_level(&c, log_lux, written > 0 || dimmed || relight, max);
 			automatic = true;
+			/* Preserve wake hysteresis across a failed or idle-suppressed write. */
+			if (target == 0 || written > 0)
+				relight = false;
 		} else {
 			wait_ms(TICK_MS, &last_key, false);
 			continue;
@@ -522,6 +590,8 @@ int main(int argc, char **argv)
 				next = target;
 			if (write_int(bright_path, next) == 0) {
 				written = next;
+				if (written > 0)
+					relight = false;
 				if (written == target && automatic)
 					auto_last = target;
 				write_failed = false;
